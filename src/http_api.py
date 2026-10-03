@@ -3,20 +3,19 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
-from urllib.parse import parse_qs, urlparse
+from typing import Any
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .domain import Actor, DomainError, PermissionDenied, ValidationError
 
 
-RECORD_RE = re.compile(r"^/api/records/(\d+)$")
-ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
-AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+PLAN_RE = re.compile(r"^/api/plans/([^/]+)$")
+PLAN_ACTION_RE = re.compile(r"^/api/plans/([^/]+)/(release|revise|berth|depart|cancel|audit)$")
 
 
 def make_handler(service: Any, static_dir: Path):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "port-berth/1.0"
+        server_version = "port-ledger/1.0"
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -28,7 +27,10 @@ def make_handler(service: Any, static_dir: Path):
                 raise PermissionDenied("缺少X-User-Id或X-Role")
             return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
 
-        def _body(self) -> Dict[str, Any]:
+        def _request_id(self) -> str:
+            return self.headers.get("X-Idempotency-Key", "").strip() or None
+
+        def _body(self) -> dict:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError as exc:
@@ -45,10 +47,7 @@ def make_handler(service: Any, static_dir: Path):
             return data
 
         def _send(self, status: int, payload: Any, content_type: str = "application/json; charset=utf-8") -> None:
-            if content_type.startswith("application/json"):
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            else:
-                body = payload
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if content_type.startswith("application/json") else payload
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -64,28 +63,44 @@ def make_handler(service: Any, static_dir: Path):
         def do_GET(self) -> None:
             try:
                 parsed = urlparse(self.path)
-                if parsed.path == "/health":
-                    self._send(200, {"status": "ok", "service": "port-berth", "database": service.repository.health()})
+                path = parsed.path
+                query = parse_qs(parsed.query)
+                if path == "/health":
+                    self._send(200, {"status": "ok", "service": "port-ledger", "database": service.repository.health()})
                     return
-                if parsed.path == "/":
-                    page = (static_dir / "index.html").read_bytes()
-                    self._send(200, page, "text/html; charset=utf-8")
+                if path == "/":
+                    self._send(200, (static_dir / "index.html").read_bytes(), "text/html; charset=utf-8")
                     return
-                if parsed.path == "/api/records":
-                    query = parse_qs(parsed.query)
-                    records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
-                    self._send(200, {"items": records})
+                actor = self._actor()
+                if path == "/api/plans":
+                    self._send(200, {"items": service.list_plans(
+                        actor, state=query.get("state", [None])[0],
+                        limit=int(query.get("limit", ["200"])[0]))})
                     return
-                match = RECORD_RE.match(parsed.path)
+                if path == "/api/holds":
+                    self._send(200, {"items": service.list_holds(
+                        actor, resource_type=query.get("resource_type", [None])[0],
+                        resource_id=query.get("resource_id", [None])[0])})
+                    return
+                if path == "/api/resources":
+                    self._send(200, {"items": service.list_resources(actor, kind=query.get("kind", [None])[0])})
+                    return
+                if path == "/api/notices":
+                    self._send(200, {"items": service.list_notices(actor)})
+                    return
+                if path == "/api/safety-basis":
+                    self._send(200, service.safety_basis(actor))
+                    return
+                if path == "/api/stats":
+                    self._send(200, service.stats(actor))
+                    return
+                match = PLAN_ACTION_RE.match(path)
+                if match and match.group(2) == "audit":
+                    self._send(200, service.timeline(actor, unquote(match.group(1))))
+                    return
+                match = PLAN_RE.match(path)
                 if match:
-                    self._send(200, service.get_record(self._actor(), int(match.group(1))))
-                    return
-                match = AUDIT_RE.match(parsed.path)
-                if match:
-                    self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
-                    return
-                if parsed.path == "/api/stats":
-                    self._send(200, service.stats(self._actor()))
+                    self._send(200, service.get_plan(actor, unquote(match.group(1))))
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
@@ -94,18 +109,39 @@ def make_handler(service: Any, static_dir: Path):
         def do_POST(self) -> None:
             try:
                 parsed = urlparse(self.path)
+                path = parsed.path
                 body = self._body()
-                if parsed.path == "/api/records":
-                    record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
-                    self._send(201, record)
+                actor = self._actor()
+                rid = self._request_id()
+                if path == "/api/resources":
+                    self._send(201, service.register_resource(actor, body, rid))
                     return
-                match = ACTION_RE.match(parsed.path)
+                if path == "/api/closures":
+                    self._send(201, service.publish_closure(actor, body, rid))
+                    return
+                if path == "/api/safety-basis":
+                    self._send(200, service.change_safety_basis(actor, body, rid))
+                    return
+                if path == "/api/plans":
+                    self._send(201, service.register_plan(actor, body.get("plan_ref", ""), body.get("params", {}), rid))
+                    return
+                if path == "/api/rebuild":
+                    self._send(200, service.rebuild(actor))
+                    return
+                match = PLAN_ACTION_RE.match(path)
                 if match:
-                    version = body.get("expected_version")
-                    if not isinstance(version, int):
-                        raise ValidationError("expected_version必须是整数")
-                    record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
-                    self._send(200, record)
+                    ref = unquote(match.group(1))
+                    action = match.group(2)
+                    if action == "release":
+                        self._send(200, service.release_plan(actor, ref, rid))
+                    elif action == "revise":
+                        self._send(200, service.revise_plan(actor, ref, body.get("params", {}), rid))
+                    elif action == "berth":
+                        self._send(200, service.berth_plan(actor, ref, body.get("actual_draft_m"), rid))
+                    elif action == "depart":
+                        self._send(200, service.depart_plan(actor, ref, rid))
+                    else:
+                        self._send(200, service.cancel_plan(actor, ref, rid))
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:

@@ -1,33 +1,50 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>港口泊位与航道调度</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
-    pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
-  </style>
+<meta charset="utf-8">
+<title>危险品船进港调度台账</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:24px;color:#1a2733}
+h1{font-size:20px}
+table{border-collapse:collapse;width:100%;margin-top:12px;font-size:13px}
+th,td{border:1px solid #d4dde5;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f2f6fa}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.released,.berthed{background:#dff3e3}.blocked,.void{background:#fde2e1}
+.draft{background:#fdf3d3}.completed,.cancelled{background:#e9edf1}
+code{background:#f2f6fa;padding:1px 4px;border-radius:3px}
+</style>
 </head>
 <body>
-<main>
-  <h1>港口泊位与航道调度</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
-  <pre id="output">点击上方按钮读取服务状态。</pre>
-</main>
+<h1>危险品船进港调度台账（事件溯源）</h1>
+<p>放行前原子预占 <code>航道区段 + 泊位净空 + 护航拖轮</code>；缺项停在待补；封航/富余水深/危险品类别变更后未靠泊安排作废重排。</p>
+<button onclick="load()">刷新台账</button>
+<table id="plans"><thead><tr>
+<th>计划</th><th>版本</th><th>状态</th><th>船/类别</th><th>航道/泊位</th><th>窗</th><th>占位</th><th>待补原因 / 冲突</th><th>放行依据</th>
+</tr></thead><tbody></tbody></table>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+const stateName={draft:'草稿',blocked:'待补',released:'已放行',berthed:'已靠泊',completed:'已完成',void:'已作废',cancelled:'已取消'};
+async function load(){
+  const r=await fetch('/api/plans',{headers:{'X-User-Id':'web','X-Role':'dispatcher'}});
+  const d=await r.json();
+  const tb=document.querySelector('#plans tbody');
+  tb.innerHTML='';
+  d.items.forEach(p=>{
+    const issues=(p.reasons||[]).map(x=>x.message).concat((p.conflicts||[]).map(x=>
+      '冲突:'+x.resource_type+'/'+x.resource_id+' 被 '+x.held_by.plan_ref+' 占用')).join('<br>');
+    tb.insertAdjacentHTML('beforeend',`<tr>
+      <td>${p.plan_ref}</td><td>#${p.revision}</td>
+      <td><span class="tag ${p.state}">${stateName[p.state]||p.state}</span></td>
+      <td>${p.params.vessel}<br>IMDG ${p.params.dg_class}</td>
+      <td>${p.params.channel_id} / ${p.params.berth_id}</td>
+      <td>${p.params.start_hour}–${p.params.end_hour}h</td>
+      <td>${(p.holds||[]).map(h=>h.resource_type+':'+h.resource_id).join(', ')}</td>
+      <td>${issues}</td>
+      <td>${p.basis?('UKC≥'+p.basis.required_ukc_m+'m，拖轮'+p.basis.required_tugs+'艘'):''}</td>
+    </tr>`);
+  });
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+load();
 </script>
 </body>
 </html>
