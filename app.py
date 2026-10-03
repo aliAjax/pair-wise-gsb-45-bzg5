@@ -3,6 +3,8 @@ import argparse
 from pathlib import Path
 
 from src.audit import AuditRecorder
+from src.dg_repository import DgRepository
+from src.dg_service import DgService
 from src.http_api import create_server
 from src.repository import Repository
 from src.rules import DomainRules
@@ -20,6 +22,10 @@ def build_service(db_path: str) -> Service:
     return Service(repository, DomainRules(), audit)
 
 
+def build_dg_service(db_path: str) -> DgService:
+    return DgService(DgRepository(db_path))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="港口泊位与航道调度")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite数据库路径")
@@ -32,7 +38,8 @@ def main() -> None:
     args = parse_args()
     Path(args.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     service = build_service(args.db)
-    server = create_server(args.host, args.port, service, BASE_DIR / "static")
+    dg_service = build_dg_service(args.db)
+    server = create_server(args.host, args.port, service, BASE_DIR / "static", dg_service)
     print("港口泊位与航道调度 listening on http://%s:%s" % (args.host, args.port), flush=True)
     try:
         server.serve_forever()

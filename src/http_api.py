@@ -12,9 +12,12 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+DG_PLAN_RE = re.compile(r"^/api/dg/plans/(\d+)$")
+DG_PLAN_ACTION_RE = re.compile(r"^/api/dg/plans/(\d+)/(submit|release|berth|depart|modify)$")
+DG_CLOSURE_ACTION_RE = re.compile(r"^/api/dg/closures/(\d+)/(modify|lift)$")
 
 
-def make_handler(service: Any, static_dir: Path):
+def make_handler(service: Any, static_dir: Path, dg_service: Any = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "port-berth/1.0"
 
@@ -61,6 +64,76 @@ def make_handler(service: Any, static_dir: Path):
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
 
+        def _handle_dg_get(self, parsed: Any) -> bool:
+            if dg_service is None:
+                return False
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if path == "/api/dg/plans":
+                self._send(200, {"items": dg_service.list_plans(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))})
+                return True
+            match = DG_PLAN_RE.match(path)
+            if match:
+                self._send(200, dg_service.get_plan(self._actor(), int(match.group(1))))
+                return True
+            if path == "/api/dg/resources":
+                self._send(200, {"items": dg_service.list_resources(self._actor(), kind=query.get("kind", [None])[0])})
+                return True
+            if path == "/api/dg/closures":
+                self._send(200, {"items": dg_service.list_closures(self._actor(), status=query.get("status", [None])[0])})
+                return True
+            if path == "/api/dg/conflicts":
+                self._send(200, {"items": dg_service.list_conflicts(self._actor())})
+                return True
+            if path == "/api/dg/ledger":
+                self._send(200, {"items": dg_service.ledger(self._actor())})
+                return True
+            if path == "/api/dg/occupancy":
+                self._send(200, {"items": dg_service.occupancy(self._actor())})
+                return True
+            return False
+
+        def _handle_dg_post(self, parsed: Any, body: Dict[str, Any]) -> bool:
+            if dg_service is None:
+                return False
+            path = parsed.path
+            if path == "/api/dg/resources":
+                self._send(201, dg_service.register_resource(self._actor(), body))
+                return True
+            if path == "/api/dg/plans":
+                self._send(201, dg_service.create_plan(self._actor(), body.get("reference", ""), body.get("data", {})))
+                return True
+            match = DG_PLAN_ACTION_RE.match(path)
+            if match:
+                plan_id = int(match.group(1))
+                action = match.group(2)
+                if action == "submit":
+                    self._send(200, dg_service.submit(self._actor(), plan_id))
+                elif action == "release":
+                    self._send(200, dg_service.release(self._actor(), plan_id))
+                elif action == "berth":
+                    self._send(200, dg_service.berth(self._actor(), plan_id))
+                elif action == "depart":
+                    self._send(200, dg_service.depart(self._actor(), plan_id))
+                else:
+                    self._send(200, dg_service.modify_plan(self._actor(), plan_id, body.get("data", {})))
+                return True
+            if path == "/api/dg/closures":
+                self._send(201, dg_service.issue_closure(self._actor(), body))
+                return True
+            match = DG_CLOSURE_ACTION_RE.match(path)
+            if match:
+                closure_id = int(match.group(1))
+                if match.group(2) == "modify":
+                    self._send(200, dg_service.modify_closure(self._actor(), closure_id, body.get("data", {})))
+                else:
+                    self._send(200, dg_service.lift_closure(self._actor(), closure_id))
+                return True
+            if path == "/api/dg/recover":
+                self._send(200, dg_service.recover(self._actor()))
+                return True
+            return False
+
         def do_GET(self) -> None:
             try:
                 parsed = urlparse(self.path)
@@ -87,6 +160,8 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if self._handle_dg_get(parsed):
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -107,6 +182,8 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
                     return
+                if self._handle_dg_post(parsed, body):
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -114,5 +191,5 @@ def make_handler(service: Any, static_dir: Path):
     return Handler
 
 
-def create_server(host: str, port: int, service: Any, static_dir: Path) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(service, static_dir))
+def create_server(host: str, port: int, service: Any, static_dir: Path, dg_service: Any = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(service, static_dir, dg_service))
